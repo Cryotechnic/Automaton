@@ -249,7 +249,7 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
             return;
         }
 
-        if (Player.IsDead)
+        if (Player.IsDead && State != DateWithDestinyState.Dead)
         {
             State = DateWithDestinyState.Dead;
             return;
