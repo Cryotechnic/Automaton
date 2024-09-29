@@ -17,6 +17,7 @@ using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using ImGuiNET;
+using IronPython.Compiler.Ast;
 using Lumina.Excel.GeneratedSheets;
 using System.Security.Permissions;
 using static ECommons.GameFunctions.ObjectFunctions;
@@ -46,6 +47,9 @@ public class DateWithDestinyConfiguration
     [BoolConfig(DependsOn = nameof(FullAuto))] public bool AutoSync = true;
     [BoolConfig(DependsOn = nameof(FullAuto))] public bool AutoTarget = true;
     [BoolConfig(DependsOn = nameof(FullAuto))] public bool AutoMoveToMobs = true;
+
+    [BoolConfig] public bool AutoRetainerIntegration = false;
+
     [IntConfig(DefaultValue = 900)] public int MaxDuration = 900;
     [IntConfig(DefaultValue = 120)] public int MinTimeRemaining = 120;
     [IntConfig(DefaultValue = 90)] public int MaxProgress = 90;
@@ -195,6 +199,10 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
         }
         ImGui.Unindent();
 
+        ImGui.Checkbox("Enable AutoRetainer Integration (Requires AutoRetainer)", ref Config.AutoRetainerIntegration);
+        if (Config.AutoRetainerIntegration)
+            TurnIn();
+
         ImGuiX.DrawSection("Fate Options");
         ImGui.DragInt("Max Duration (s)", ref Config.MaxDuration);
         ImGui.SameLine();
@@ -219,12 +227,16 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
         EzConfigGui.WindowSystem.AddWindow(new FateTrackerUI(this));
         random = new();
         Svc.Framework.Update += OnUpdate;
+        if (Config.AutoRetainerIntegration)
+            P.AutoRetainerAPI.OnCharacterReadyToPostProcess += TurnIn;
+
     }
 
     public override void Disable()
     {
         Utils.RemoveWindow<FateTrackerUI>();
         Svc.Framework.Update -= OnUpdate;
+        P.AutoRetainerAPI.OnCharacterReadyToPostProcess -= TurnIn;
     }
 
     [CommandHandler("/vfate", "Opens the FATE tracker")]
@@ -258,13 +270,12 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
         // Update target position continually so we don't pingpong
         if (Svc.Targets.Target != null)
         {
-            var target = Svc.Targets.Target;
-            TargetPos = target.Position;
-            if ((Config.FullAuto || Config.AutoMoveToMobs) && !IsInMeleeRange(target.HitboxRadius + (Config.StayInMeleeRange ? 0 : 15)))
+            if (State != DateWithDestinyState.Ready)
             {
-                TargetAndMoveToEnemy(target);
-                return;
+                State = DateWithDestinyState.Ready;
+                Svc.Log.Info("State Change: " + State.ToString());
             }
+            return;
         }
 
         var cf = FateManager.Instance()->CurrentFate;
@@ -337,6 +348,7 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
                 // TODO: not implemented
                 return;
             case DateWithDestinyState.InCombat:
+
                 if (cf == null && !Svc.Condition[ConditionFlag.InCombat] && !Player.IsCasting)
                 {
                     State = DateWithDestinyState.Ready;
@@ -692,5 +704,35 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
         GetNameplateColor ??= EzDelegate.Get<GetNameplateColorDelegate>(GetNameplateColorSig);
         var plateType = GetNameplateColor(a.Address);
         return plateType == 10;
+    }
+
+    // From ARTurnIn, thanks for making my life not miserable :)
+    // could also just find a way to integrate this with ARTurnIn module instead of copy-pasting the code
+    private void TurnIn()
+    {
+        TaskManager.Enqueue(GoToGC, configuration: new(timeLimitMS: 2 * 60 * 1000));
+        TaskManager.EnqueueDelay(1000);
+        TaskManager.Enqueue(Deliveroo, configuration: new(timeLimitMS: 10 * 60 * 1000, abortOnTimeout: false));
+        TaskManager.EnqueueDelay(1000);
+        // TaskManager.Enqueue(GoHome, configuration: new(timeLimitMS: 1 * 60 * 1000));
+        // TaskManager.EnqueueDelay(1000);
+        // TaskManager.Enqueue(MoveForwards);
+        // TaskManager.EnqueueDelay(1000);
+        TaskManager.Enqueue(P.AutoRetainerAPI.FinishCharacterPostProcess);
+    }
+
+    private void GoToGC() => TaskManager.InsertMulti([new(() => P.Lifestream.ExecuteCommand("gc")), new(() => P.Lifestream.IsBusy()), new(() => !P.Lifestream.IsBusy())]);
+    private void Deliveroo() => TaskManager.InsertMulti([new(() => Svc.Commands.ProcessCommand("/deliveroo enable")), new(() => P.Deliveroo.IsTurnInRunning()), new(() => !P.Deliveroo.IsTurnInRunning())]);
+    private void GoHome() => TaskManager.InsertMulti([new(P.Lifestream.TeleportToFC), new(() => P.Lifestream.IsBusy()), new(() => !P.Lifestream.IsBusy())]);
+
+    private unsafe void MoveForwards()
+    {
+        TaskManager.InsertMulti(
+        [
+            new(P.Navmesh.IsReady),
+            new(() => P.Navmesh.PathfindAndMoveTo(P.Navmesh.NearestPoint(Utils.RotatePoint(Player.Object.Position.X, Player.Object.Position.Z, MathF.PI - Player.CameraEx->DirH, Player.Object.Position + new Vector3(0, 0, 5)), 1, 5) ?? Player.Position, false)),
+            new(() => P.Navmesh.IsRunning()),
+            new(() => !P.Navmesh.IsRunning())
+        ]);
     }
 }
