@@ -13,6 +13,7 @@ using FFXIVClientStructs.FFXIV.Client.Game.Fate;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using ImGuiNET;
+using IronPython.Compiler.Ast;
 using Lumina.Excel.GeneratedSheets;
 using static ECommons.GameFunctions.ObjectFunctions;
 
@@ -58,9 +59,7 @@ public enum DateWithDestinyState
 {
     Unknown,
     Ready,
-    Standing,
-    Mounted,
-    Flying,
+    Mounting,
     MovingToFate,
     InteractingWithNpc,
     InCombat,
@@ -151,8 +150,6 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
     private static readonly uint[] ForlornIDs = [7586, 7587];
     private static readonly uint[] TwistOfFateStatusIDs = [1288, 1289];
 
-    private ushort nextFateID;
-    private byte fateMaxLevel;
     private ushort fateID;
     private ushort FateID
     {
@@ -239,7 +236,6 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
 
     private int _successiveInstanceChanges = 0;
     private readonly int _distanceToTargetAetheryte = 50; // object.IsTargetable has a larger range than actually clickable
-    private int _ticks = 0; // to not spam logging
 
     private unsafe void OnUpdate(IFramework framework)
     {
@@ -249,99 +245,69 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
 
         if (!active)
         {
-            State = DateWithDestinyState.Ready;
+            if (State != DateWithDestinyState.Ready)
+            {
+                State = DateWithDestinyState.Ready;
+                Svc.Log.Info("State Change: " + State.ToString());
+            }
             return;
         }
 
-        // Update target position continually so we don't pingpong
-        if (Svc.Targets.Target != null)
-        {
-            var target = Svc.Targets.Target;
-            TargetPos = target.Position;
-            if ((Config.FullAuto || Config.AutoMoveToMobs) && !IsInMeleeRange(target.HitboxRadius + (Config.StayInMeleeRange ? 0 : 15)))
-            {
-                TargetAndMoveToEnemy(target);
-                return;
-            }
-        }
-
-        if (_ticks % 50 == 0)
-        {
-            Svc.Log.Info("State: " + State.ToString());
-        }
-        _ticks += 1;
-
         var cf = FateManager.Instance()->CurrentFate;
+        var nextFate = GetFates().FirstOrDefault();
+        var bicolorGemstoneCount = GetItemCount(26807);
         switch (State)
         {
             case DateWithDestinyState.Ready:
                 if (cf != null)
                     State = DateWithDestinyState.InCombat;
-                else if (Svc.Condition[ConditionFlag.InFlight])
-                    State = DateWithDestinyState.Flying;
-                else if (Svc.Condition[ConditionFlag.Mounted] || Svc.Condition[ConditionFlag.Mounted2])
-                    State = DateWithDestinyState.Mounted;
+                else if (nextFate == null)
+                    State = DateWithDestinyState.ChangingInstances;
                 else
-                    State = DateWithDestinyState.Standing;
+                    State = DateWithDestinyState.MovingToFate;
+                Svc.Log.Info("State Change: " + State.ToString());
                 return;
-            case DateWithDestinyState.Standing:
-                if (Svc.Condition[ConditionFlag.Mounted])
-                    State = DateWithDestinyState.Mounted;
-                else if (Svc.Condition[ConditionFlag.InCombat])
-                    State = DateWithDestinyState.InCombat;
-                else if ((Config.FullAuto || Config.AutoMount) && !Player.Occupied)
+            case DateWithDestinyState.Mounting:
+                if ((Config.FullAuto || Config.AutoMount) && !Player.Occupied && !(Svc.Condition[ConditionFlag.Mounted] || Svc.Condition[ConditionFlag.Mounted2]))
                     ExecuteMount();
-                return;
-            case DateWithDestinyState.Mounted:
-                if (Svc.Condition[ConditionFlag.InFlight])
-                    State = DateWithDestinyState.Flying;
                 else if ((Config.FullAuto || Config.AutoFly) && !Player.Occupied && Svc.Condition[ConditionFlag.Mounted] && !Svc.Condition[ConditionFlag.InFlight])
                     ExecuteJump();
-                return;
-            case DateWithDestinyState.Flying:
-                var nextFate = GetFates().FirstOrDefault();
-                if (nextFate is not null)
+                else if (Svc.Condition[ConditionFlag.InFlight])
                 {
-                    if (Config.YokaiMode)
-                        YokaiMode();
-
-                    if (!P.Navmesh.PathfindInProgress() && !P.Navmesh.IsRunning())
-                    {
-                        Svc.Log.Info("Finding path to fate");
-                        nextFateID = nextFate.FateId;
-
-                        _successiveInstanceChanges = 0;
-                        unsafe { AgentMap.Instance()->SetFlagMapMarker(Svc.ClientState.TerritoryType, Svc.ClientState.MapId, FateManager.Instance()->GetFateById(nextFateID)->Location); }
-                        State = DateWithDestinyState.MovingToFate;
-                        MoveToNextFate(nextFate.FateId);
-                    }
-                }
-                else if (nextFate is null)
-                {
-                    Svc.Log.Info("No eligible fates. Number of instances: " + P.Lifestream.GetNumberOfInstances());
-                    if (Config.ChangeInstances && P.Lifestream.GetNumberOfInstances() != 1)
-                    {
-                        State = DateWithDestinyState.ChangingInstances;
-                        ChangeInstances();
-                    }
+                    State = DateWithDestinyState.MovingToFate;
+                    Svc.Log.Info("State Change: " + State.ToString());
                 }
                 return;
             case DateWithDestinyState.MovingToFate:
+                _successiveInstanceChanges = 0;
+                unsafe { AgentMap.Instance()->SetFlagMapMarker(Svc.ClientState.TerritoryType, Svc.ClientState.MapId, FateManager.Instance()->GetFateById(nextFate!.FateId)->Location); }
+                if (!Svc.Condition[ConditionFlag.InFlight])
+                {
+                    State = DateWithDestinyState.Mounting;
+                    Svc.Log.Info("State Change: " + State.ToString());
+                    return;
+                }
+
                 if (!P.Navmesh.PathfindInProgress() && !P.Navmesh.IsRunning())
                 {
                     if (cf is not null)
+                    {
                         State = DateWithDestinyState.InCombat;
+                        Svc.Log.Info("State Change: " + State.ToString());
+                    }
                     else
-                        State = DateWithDestinyState.Ready;
+                        MoveToNextFate(nextFate!.FateId);
                 }
                 return;
             case DateWithDestinyState.InteractingWithNpc:
                 // TODO: not implemented
                 return;
             case DateWithDestinyState.InCombat:
+
                 if (cf == null && !Svc.Condition[ConditionFlag.InCombat] && !Player.IsCasting)
                 {
                     State = DateWithDestinyState.Ready;
+                    Svc.Log.Info("State Change: " + State.ToString());
                     FateID = 0;
                 }
                 else
@@ -349,7 +315,6 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
                     if (Svc.Condition[ConditionFlag.Mounted]) ExecuteDismount();
 
                     var target = Svc.Targets.Target;
-
                     if (P.Navmesh.IsRunning() && Svc.Targets.Target?.ObjectKind == ObjectKind.BattleNpc &&
                         (DistanceToTarget() < 2 || (target != null && DistanceToHitboxEdge(target.HitboxRadius) <= (Config.StayInMeleeRange ? 0 : 15))))
                     {
@@ -382,8 +347,12 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
                 }
                 return;
             case DateWithDestinyState.ChangingInstances:
+                Svc.Log.Info("_successiveInstanceChanges: " + _successiveInstanceChanges);
                 if (ChangeInstances())
+                {
                     State = DateWithDestinyState.Ready;
+                    Svc.Log.Info("State Change: " + State.ToString());
+                }
                 return;
             case DateWithDestinyState.ExchangingVouchers:
                 // TODO: not implemented
@@ -432,20 +401,9 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
             var directTravelDistance = Vector3.Distance(Player.Position, targetPos);
             var closestAetheryte = Coords.GetNearestAetheryte(Svc.ClientState.TerritoryType, targetPos);
 
-            if (_ticks % 50 == 0)
-            {
-                Svc.Log.Info("Player.Position: " + Player.Position.X + " " + Player.Position.Y + " " + Player.Position.Z);
-                Svc.Log.Info("targetPos: " + targetPos.X + " " + targetPos.Y + " " + targetPos.Z);
-                Svc.Log.Info("Direct flight distance is: " + directTravelDistance);
-                Svc.Log.Info("Closest aetheryte to next fate is: " + closestAetheryte);
-            }
             if (closestAetheryte != 0)
             {
                 var aetheryteTravelDistance = Coords.GetDistanceToAetheryte(closestAetheryte, targetPos) + teleportTimePenalty;
-                if (_ticks % 50 == 0)
-                {
-                    Svc.Log.Info("Travel distance via aetheryte: " + aetheryteTravelDistance);
-                }
                 if (aetheryteTravelDistance < directTravelDistance) // if the closest aetheryte is a shortcut, then teleport
                     ExecuteTeleport(closestAetheryte);
                 else // if the closest aetheryte is too far away, just fly directly to the fate
@@ -484,23 +442,19 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
 
     private unsafe bool ChangeInstances()
     {
-        if (_ticks % 50 == 0)
-        {
-            Svc.Log.Debug("ChangeInstances()");
-        }
         var numberOfInstances = P.Lifestream.GetNumberOfInstances();
         if (_successiveInstanceChanges >= numberOfInstances - 1)
         {
+            P.TaskManager.Enqueue(() => EzThrottler.Throttle("SuccessiveInstanceChanges", 10000));
+            P.TaskManager.Enqueue(() => EzThrottler.Check("SuccessiveInstanceChanges"));
+            Svc.Log.Info("Cycled through all instances. Waiting 10s.");
             _successiveInstanceChanges = 0;
-            //System.Threading.Thread.Sleep(10000);
-            EzThrottler.Throttle("Cycled through all instances. Waiting 10s.", 10000);
             return false;
         }
 
-        if (_ticks % 50 == 0)
-        {
-            Svc.Log.Debug("SuccessiveInstanceChanges low.");
-        }
+        if (P.Navmesh.PathfindInProgress() || P.Navmesh.IsRunning())
+            return false;
+
         var closestAetheryteDataId = Coords.GetNearestAetheryte((int)Player.Territory, Player.Position);
         var closestAetheryteGameObject = Svc.Objects
             .Where(x => x is { ObjectKind: ObjectKind.Aetheryte })
@@ -512,28 +466,15 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
             return false;
         }
 
-        if (_ticks % 50 == 0)
-        {
-            Svc.Log.Debug("Within 50 of aetheryte.");
-        }
         if (Svc.Targets.Target?.ObjectKind != ObjectKind.Aetheryte)
         {
             Svc.Targets.Target = closestAetheryteGameObject;
             return false;
         }
 
-        if (_ticks % 50 == 0)
-        {
-            Svc.Log.Debug("Targeting aetheryte.");
-            Svc.Log.Debug("Attempting to change instance");
-        }
         // If too far away to target or "target is too far below you" error
         if (DistanceToTarget() > 10 || Player.Position.Y - Svc.Targets.Target.Position.Y > 2)
         {
-            if (_ticks % 50 == 0)
-            {
-                Svc.Log.Debug("Not close enough to change instance. Moving closer");
-            }
             // interact distance is between 8 and 10. less than 8 and you will run into the base of the aetheryte
             var closerToAetheryte = Svc.Targets.Target.Position - (Vector3.Normalize(Svc.Targets.Target.Position - Player.Position) * 8);
             closerToAetheryte.Y = Math.Min(closerToAetheryte.Y, Svc.Targets.Target.Position.Y + 1);
@@ -608,7 +549,7 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
         && x.ObjectKind == ObjectKind.BattleNpc
         && x.SubKind == (byte)BattleNpcSubKind.Enemy
         && (x.Struct() != null && x.Struct()->FateId == FateID)
-        )//&& Math.Sqrt(Math.Pow(x.Position.X - CurrentFate->Location.X, 2) + Math.Pow(x.Position.Z - CurrentFate->Location.Z, 2)) < CurrentFate->Radius)
+        && Math.Sqrt(Math.Pow(x.Position.X - CurrentFate->Location.X, 2) + Math.Pow(x.Position.Z - CurrentFate->Location.Z, 2)) < CurrentFate->Radius)
         // Prioritize Forlorns if configured
         .OrderByDescending(x => Config.PrioritizeForlorns && ForlornIDs.Contains(x.DataId))
         // Prioritize enemies targeting us
@@ -626,7 +567,7 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
     private unsafe bool HaveYokaiMinionsMissing() => Yokai.Any(x => CompanionUnlocked(x.Minion));
     private unsafe int GetItemCount(uint itemID) => InventoryManager.Instance()->GetInventoryItemCount(itemID);
 
-    private unsafe FateContext* CurrentFate => FateManager.Instance()->GetFateById(nextFateID);
+    private unsafe FateContext* CurrentFate => FateManager.Instance()->CurrentFate;
 
     private unsafe float DistanceToFate() => Vector3.Distance(CurrentFate->Location, Svc.ClientState.LocalPlayer!.Position);
     private unsafe float DistanceToTarget() => (Svc.Targets.Target is not null) ? Vector3.Distance(Svc.Targets.Target.Position, Svc.ClientState.LocalPlayer!.Position) : 0;
@@ -648,7 +589,7 @@ internal class DateWithDestiny : Tweak<DateWithDestinyConfiguration>
     {
         if (value != 0 && PlayerState.Instance()->IsLevelSynced == 0)
         {
-            if (Player.Level > fateMaxLevel)
+            if (Player.Level > CurrentFate->MaxLevel)
                 ECommons.Automation.Chat.Instance.SendMessage("/lsync");
         }
     }
